@@ -1,5 +1,3 @@
-
-#define BUFFER_SIZE 1024
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +9,7 @@
 #include <grp.h>
 #include <time.h>
 
+#define BUFFER_SIZE 1024
 
 void setPermissions(mode_t mode, char *permStr)
 {
@@ -39,7 +38,7 @@ int checkDangerous(const char *path)
     else if (pid == 0)
     {
         execlp("./verify_danger.sh", "verify_danger.sh", path, NULL);
-        perror("eroare la executare");
+        perror("Failed to execute script");
         exit(1);
     }
 
@@ -55,7 +54,7 @@ void isolateFile(const char *path, const char *isolationDir)
     printf("File %s has been moved to %s for isolation.\n", path, newLocation);
 }
 
-void creaza_snapshot(char *directoryPath, FILE *outputFile, const char *isolationDir, int writeToPipe)
+void createDirectorySnapshot(char *directoryPath, FILE *outputFile, const char *isolationDir, int writeToPipe)
 {
     char fullPath[1000];
     struct dirent *entry;
@@ -101,7 +100,7 @@ void creaza_snapshot(char *directoryPath, FILE *outputFile, const char *isolatio
 
                 if (S_ISDIR(attributes.st_mode))
                 {
-                    creaza_snapshot(fullPath, outputFile, isolationDir, writeToPipe);
+                    createDirectorySnapshot(fullPath, outputFile, isolationDir, writeToPipe);
                 }
             }
         }
@@ -122,4 +121,49 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    char *outputDir = argv
+    char *outputDir = argv[2];
+    char *isolationDir = argv[4];
+    mkdir(outputDir, 0755);
+    mkdir(isolationDir, 0755);
+
+    int fds[2];
+    if (pipe(fds) == -1)
+    {
+        perror("Could not create pipe");
+        exit(1);
+    }
+
+    for (int i = 5; i < argc; i++)
+    {
+        pid_t pid = fork();
+        if (pid == 0)
+        {
+            close(fds[0]);
+            char snapshotFilePath[1024];
+            snprintf(snapshotFilePath, sizeof(snapshotFilePath), "%s/%s_snapshot.txt", outputDir, argv[i]);
+            FILE *filePtr = fopen(snapshotFilePath, "w");
+            if (!filePtr)
+            {
+                perror("Failed to open snapshot file");
+                exit(1);
+            }
+            createDirectorySnapshot(argv[i], filePtr, isolationDir, fds[1]);
+            fclose(filePtr);
+            close(fds[1]);
+            exit(0);
+        }
+    }
+
+    close(fds[1]);
+
+    char readBuffer[BUFFER_SIZE];
+    while (read(fds[0], readBuffer, BUFFER_SIZE) > 0)
+    {
+        printf("%s", readBuffer);
+    }
+    close(fds[0]);
+
+    while (wait(NULL) > 0);
+
+    return 0;
+}
