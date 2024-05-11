@@ -1,134 +1,125 @@
+
+#define BUFFER_SIZE 1024
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <sys/wait.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <pwd.h>
+#include <grp.h>
+#include <time.h>
 
-typedef struct {
-    char nume[256];
-    long dimensiune;
-} Metadate;
 
-void creareSnapshot(const char *cale, const char *directorSnapshot) {
-    DIR *dir = opendir(cale);
-    if (dir == NULL) {
-        perror("Eroare la deschiderea directorului");
-        exit(EXIT_FAILURE);
+void setPermissions(mode_t mode, char *permStr)
+{
+    strcpy(permStr, "---------");
+    if (mode & S_IRUSR) permStr[0] = 'r';
+    if (mode & S_IWUSR) permStr[1] = 'w';
+    if (mode & S_IXUSR) permStr[2] = 'x';
+    if (mode & S_IRGRP) permStr[3] = 'r';
+    if (mode & S_IWGRP) permStr[4] = 'w';
+    if (mode & S_IXGRP) permStr[5] = 'x';
+    if (mode & S_IROTH) permStr[6] = 'r';
+    if (mode & S_IWOTH) permStr[7] = 'w';
+    if (mode & S_IXOTH) permStr[8] = 'x';
+}
+
+int checkDangerous(const char *path)
+{
+    int status;
+    pid_t pid = fork();
+
+    if (pid == -1)
+    {
+        perror("Fork failed");
+        return 0;
+    }
+    else if (pid == 0)
+    {
+        execlp("./verify_danger.sh", "verify_danger.sh", path, NULL);
+        perror("eroare la executare");
+        exit(1);
     }
 
-    struct dirent *intrare;
-    struct stat statusFisier;
-    Metadate metadate;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 1;
+}
 
-    while ((intrare = readdir(dir)) != NULL) {
-        if (strcmp(intrare->d_name, ".") && strcmp(intrare->d_name, "..")) {
-            char caleNoua[257];
-            sprintf(caleNoua, "%s/%s", cale, intrare->d_name);
+void isolateFile(const char *path, const char *isolationDir)
+{
+    char newLocation[PATH_MAX];
+    sprintf(newLocation, "%s/%s", isolationDir, strrchr(path, '/') + 1);
+    rename(path, newLocation);
+    printf("File %s has been moved to %s for isolation.\n", path, newLocation);
+}
 
-            if (stat(caleNoua, &statusFisier) == -1) {
-                perror("Eroare la obținerea metadatelor fișierului");
-                exit(EXIT_FAILURE);
-            }
+void creaza_snapshot(char *directoryPath, FILE *outputFile, const char *isolationDir, int writeToPipe)
+{
+    char fullPath[1000];
+    struct dirent *entry;
+    DIR *dir = opendir(directoryPath);
+    struct stat attributes;
+    struct tm *modTime;
+    char perms[10];
+    int dangerousCount = 0;
 
-            strcpy(metadate.nume, intrare->d_name);
-            metadate.dimensiune = statusFisier.st_size;
+    if (!dir)
+    {
+        perror("Directory could not be opened");
+        return;
+    }
 
-            char caleSnapshot[512];
-            sprintf(caleSnapshot, "%s/%s.snapshot", directorSnapshot, metadate.nume);
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+        {
+            strcpy(fullPath, directoryPath);
+            strcat(fullPath, "/");
+            strcat(fullPath, entry->d_name);
 
-            FILE *snapshot = fopen(caleSnapshot, "w");
-            if (snapshot != NULL) {
-                fwrite(&metadate, sizeof(Metadate), 1, snapshot);
-                fclose(snapshot);
-                printf("Snapshot pentru %s creat cu succes.\n", metadate.nume);
-            } else {
-                perror("Eroare la crearea snapshot-ului");
-                exit(EXIT_FAILURE);
+            if (stat(fullPath, &attributes) == 0)
+            {
+                modTime = localtime(&attributes.st_mtime);
+                setPermissions(attributes.st_mode, perms);
+                fprintf(outputFile, "Name: %s\nSize: %ld\nPermissions: %s\nLast Modified: %d-%02d-%02d %02d:%02d:%02d\nOwner: %s, Group: %s\nInode Number: %ld\n\n",
+                        fullPath, attributes.st_size, perms,
+                        modTime->tm_year + 1900, modTime->tm_mon + 1, modTime->tm_mday,
+                        modTime->tm_hour, modTime->tm_min, modTime->tm_sec,
+                        getpwuid(attributes.st_uid)->pw_name,
+                        getgrgid(attributes.st_gid)->gr_name, attributes.st_ino);
+
+                if (strcmp(perms, "---------") == 0)
+                {
+                    if (checkDangerous(fullPath))
+                    {
+                        dangerousCount++;
+                        isolateFile(fullPath, isolationDir);
+                    }
+                }
+
+                if (S_ISDIR(attributes.st_mode))
+                {
+                    creaza_snapshot(fullPath, outputFile, isolationDir, writeToPipe);
+                }
             }
         }
     }
+
+    char message[BUFFER_SIZE];
+    snprintf(message, BUFFER_SIZE, "Child process %d finished with PID %d and detected %d potentially dangerous files.\n", getpid(), getpid(), dangerousCount);
+    write(writeToPipe, message, strlen(message));
 
     closedir(dir);
 }
 
-void parcurgere(const char *path) {
-    struct stat fisIn;
-    stat(path, &fisIn);
-
-    if (S_ISDIR(fisIn.st_mode)) {
-        struct dirent *db;
-        DIR *director = opendir(path);
-
-        while ((db = readdir(director)) != NULL) {
-            char new[257];
-            sprintf(new, "%s/%s", path, db->d_name);
-
-            if (strcmp(db->d_name, ".") && strcmp(db->d_name, "..")) {
-                printf("| - %s\n", db->d_name);
-                parcurgere(new);
-            }
-        }
-        closedir(director);
-    }
-}
-
-int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        fprintf(stderr, "Utilizare: %s director1 director2 ... director10 -o director_iesire\n", argv[0]);
-        return EXIT_FAILURE;
+int main(int argc, char *argv[])
+{
+    if (argc < 6)
+    {
+        printf("Usage: %s -o <output_dir> -s <isolation_dir> <dir1> <dir2> ...\n", argv[0]);
+        return 1;
     }
 
-    char *directorIesire = NULL;
-    int index = -1;
-
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-o") == 0 && i < argc - 1) {
-            directorIesire = argv[i + 1];
-            index = i + 1;
-            break;
-        }
-    }
-
-    if (index == -1) {
-        fprintf(stderr, "Utilizare: %s director1 director2 ... director10 -o director_iesire\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    DIR *verificareDir = opendir(directorIesire);
-    if (verificareDir != NULL) {
-        printf("Directorul de ieșire \"%s\" există deja.\n", directorIesire);
-        closedir(verificareDir);
-    } else {
-        if (mkdir(directorIesire, 0755) == -1) {
-            perror("Eroare la crearea directorului de ieșire");
-            return EXIT_FAILURE;
-        }
-    }
-
-    for (int i = 1; i < argc; i++) {
-        if (i != index && strcmp(argv[i], "-o") != 0) {
-            pid_t pid = fork();
-            if (pid == -1) {
-                perror("Eroare la crearea procesului copil");
-                exit(EXIT_FAILURE);
-            } else if (pid == 0) {
-                creareSnapshot(argv[i], directorIesire);
-                exit(EXIT_SUCCESS);
-            }
-        }
-    }
-
-    int status;
-    pid_t childPid;
-    while ((childPid = wait(&status)) != -1) {
-        if (WIFEXITED(status)) {
-            printf("Procesul copil %d a fost terminat cu codul de ieșire %d.\n", childPid, WEXITSTATUS(status));
-        } else {
-            printf("Procesul copil %d a fost terminat anormal.\n", childPid);
-        }
-    }
-
-    return EXIT_SUCCESS;
-}
+    char *outputDir = argv
